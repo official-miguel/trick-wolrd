@@ -54,6 +54,7 @@
               <button data-f="all" class="on">All <span class="n" id="n-all"></span></button>
               <button data-f="inactive">Waiting <span class="n" id="n-inactive"></span></button>
               <button data-f="active">Active <span class="n" id="n-active"></span></button>
+              <button data-f="expired">Expired <span class="n" id="n-expired"></span></button>
               <button data-f="online">Online <span class="n" id="n-online"></span></button>
             </div>
             <label class="search"><span data-icon="search"></span>
@@ -97,6 +98,7 @@
       let busyUi = false; // a dialog or menu is open
 
       const isOnline = (u) => u.has_session && u.last_seen && Date.now() - new Date(u.last_seen) < ONLINE_MS;
+      const isExpired = (u) => !u.is_active && !u.is_admin && u.expires_at && new Date(u.expires_at) <= Date.now();
       const isNew = (u) => Date.now() - new Date(u.created_at) < 24 * 3600 * 1000;
       const initials = (u) =>
         ((u.full_name || u.email || "?").trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
@@ -119,7 +121,8 @@
 
       function matches(u) {
         if (filter === "active" && !u.is_active) return false;
-        if (filter === "inactive" && (u.is_active || u.is_admin)) return false;
+        if (filter === "inactive" && (u.is_active || u.is_admin || isExpired(u))) return false;
+        if (filter === "expired" && !isExpired(u)) return false;
         if (filter === "online" && !isOnline(u)) return false;
         if (!query) return true;
         return [u.full_name, u.email, u.phone, u.code].join(" ").toLowerCase().includes(query);
@@ -129,11 +132,13 @@
         const counts = {
           all: users.length,
           active: users.filter((u) => u.is_active).length,
-          inactive: users.filter((u) => !u.is_active && !u.is_admin).length,
+          inactive: users.filter((u) => !u.is_active && !u.is_admin && !isExpired(u)).length,
+          expired: users.filter(isExpired).length,
           online: users.filter(isOnline).length,
         };
         for (const k in counts) {
-          document.getElementById("k-" + k).textContent = counts[k];
+          const kEl = document.getElementById("k-" + k);
+          if (kEl) kEl.textContent = counts[k];
           document.getElementById("n-" + k).textContent = counts[k];
         }
         document.getElementById("navCount").textContent = counts.all;
@@ -153,10 +158,19 @@
 
       function row(u) {
         const online = isOnline(u);
-        const status = u.is_active
+        let status = u.is_active
           ? '<span class="badge ok">Active</span>'
-          : u.is_admin ? '<span class="badge neutral">Super admin</span>' : '<span class="badge warn">Waiting for code</span>';
-        const codeState = !u.code ? "" : u.code_used ? "Used" : "Not used yet";
+          : u.is_admin ? '<span class="badge neutral">Super admin</span>'
+          : isExpired(u) ? '<span class="badge err">Expired</span>'
+          : '<span class="badge warn">Waiting for code</span>';
+        if (u.is_active && !u.is_admin) {
+          status += u.expires_at
+            ? `<div class="u-sub" style="margin-top:4px">Until ${esc(TW.fmtDate(u.expires_at))} · ${esc(TW.timeLeft(u.expires_at))}</div>`
+            : '<div class="u-sub" style="margin-top:4px">No end date</div>';
+        } else if (isExpired(u)) {
+          status += `<div class="u-sub" style="margin-top:4px">Ended ${esc(TW.fmtDate(u.expires_at))}</div>`;
+        }
+        const codeState = !u.code ? "" : u.code_used ? "Used" : "Not used yet · " + TW.planLabel(u.code_plan_months || 1);
         const tries = u.attempts ? ` · ${u.attempts} wrong ${u.attempts === 1 ? "try" : "tries"}` : "";
         const device = u.has_session
           ? `<div><span class="online ${online ? "on" : ""}"></span>${esc(u.device_info || "Unknown device")}</div>
@@ -201,6 +215,7 @@
         menu.innerHTML = `
           <button data-m="copy" ${u.code ? "" : "disabled"}>${icon("copy")}Copy code</button>
           <button data-m="code">${icon("key")}Make new code</button>
+          ${u.is_active && !u.is_admin ? `<button data-m="extend">${icon("refresh")}Recharge (add time)</button>` : ""}
           ${u.phone ? `<a data-m="wa" href="${TW.waLink("Hello " + first + ", ", u.phone)}" target="_blank" rel="noopener">${icon("message")}Message on WhatsApp</a>` : ""}
           <div class="menu-sep"></div>
           <button data-m="logout" class="danger" ${u.has_session ? "" : "disabled"}>${icon("power")}Log out device</button>`;
@@ -265,11 +280,39 @@
             <button class="btn ${danger ? "btn-danger" : "btn-primary"}" data-d="ok">${esc(ok)}</button>
           </div>`);
 
-      function showCode(u, code) {
+      // Ask which plan to give. Resolves to the number of months, or null if cancelled.
+      async function pickPlan({ title, body, ok }) {
+        let months = TW.PLANS[0].months;
+        const yes = await modal(`<h2>${esc(title)}</h2><p>${esc(body)}</p>
+          <div class="plans" role="radiogroup" aria-label="Plan">
+            ${TW.PLANS.map((p, i) => `<button type="button" class="plan ${i === 0 ? "on" : ""}" role="radio" aria-checked="${i === 0}" data-months="${p.months}">
+                <span class="plan-name">${TW.monthsText(p.months)}</span>
+                <span class="plan-price">KSh ${p.price}</span>
+              </button>`).join("")}
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" data-d="cancel">Cancel</button>
+            <button class="btn btn-primary" data-d="ok">${esc(ok)}</button>
+          </div>`, (m) => {
+          m.querySelectorAll(".plan").forEach((b) => {
+            b.onclick = () => {
+              months = Number(b.dataset.months);
+              m.querySelectorAll(".plan").forEach((x) => {
+                x.classList.toggle("on", x === b);
+                x.setAttribute("aria-checked", x === b);
+              });
+            };
+          });
+        });
+        return yes ? months : null;
+      }
+
+      function showCode(u, code, months) {
         const first = (u.full_name || "").split(" ")[0];
-        const msg = `Hello ${first}, your Trick World activation code is ${code}\n\nLog in and enter it on the activation page.`;
+        const plan = TW.monthsText(months);
+        const msg = `Hello ${first}, your Trick World activation code is ${code}\n\nIt gives you ${plan} of access. Log in and enter it on the activation page.`;
         return modal(`<h2>New activation code</h2>
-          <p>For ${esc(u.full_name || u.email)}. Their old code no longer works.</p>
+          <p>For ${esc(u.full_name || u.email)} · ${esc(TW.planLabel(months))}. Their old code no longer works. The ${esc(plan)} start when they enter it.</p>
           <div class="big-code">${esc(code)}</div>
           <div class="modal-actions">
             <button class="btn btn-secondary" data-copy>${icon("copy")}<span>Copy</span></button>
@@ -318,21 +361,39 @@
               });
               if (yes) run(btn, "tw_admin_set_active", { p_user: u.id, p_active: false }, who + " deactivated");
             } else {
-              run(btn, "tw_admin_set_active", { p_user: u.id, p_active: true }, who + " activated");
+              const months = await pickPlan({
+                title: "Activate " + who,
+                body: "Choose how long the account stays active. When the time runs out it is switched off and they're asked to recharge.",
+                ok: "Activate",
+              });
+              if (months) run(btn, "tw_admin_set_active", { p_user: u.id, p_active: true, p_months: months },
+                who + " activated for " + TW.monthsText(months));
             }
             break;
 
+          case "extend": {
+            const months = await pickPlan({
+              title: "Recharge " + who,
+              body: u.expires_at
+                ? "The time is added on top of what's left. Currently active until " + TW.fmtDate(u.expires_at) + "."
+                : "This account has no end date yet. It will end after the plan you choose.",
+              ok: "Add time",
+            });
+            if (months) run(btn, "tw_admin_set_active", { p_user: u.id, p_active: true, p_months: months },
+              TW.monthsText(months) + " added for " + who);
+            break;
+          }
+
           case "code": {
-            if (u.code && !u.code_used) {
-              const yes = await confirmBox({
-                title: "Make a new code?",
-                body: who + " has a code that hasn't been used yet. A new code will replace it.",
-                ok: "Make new code",
-              });
-              if (!yes) return;
-            }
-            const code = await run(btn, "tw_admin_new_code", { p_user: u.id });
-            if (code) showCode(u, code);
+            const months = await pickPlan({
+              title: "Make a new code",
+              body: (u.code && !u.code_used ? who + " has a code that hasn't been used yet. The new one replaces it. " : "") +
+                "Which plan does this code give?",
+              ok: "Make new code",
+            });
+            if (!months) return;
+            const code = await run(btn, "tw_admin_new_code", { p_user: u.id, p_months: months });
+            if (code) showCode(u, code, months);
             break;
           }
 

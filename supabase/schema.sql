@@ -33,6 +33,12 @@ create table if not exists public.activation_codes (
   issued_at  timestamptz not null default now()
 );
 
+-- Paid plans: when an account is activated it gets an end date.
+-- When that date passes the account is switched off and the user must recharge.
+alter table public.profiles         add column if not exists expires_at  timestamptz;
+alter table public.profiles         add column if not exists plan_months int;
+alter table public.activation_codes add column if not exists plan_months int not null default 1;
+
 alter table public.profiles         enable row level security;
 alter table public.activation_codes enable row level security;
 
@@ -75,6 +81,19 @@ returns boolean language sql stable security definer set search_path = '' as $$
   select coalesce((select is_admin from public.profiles where id = auth.uid()), false)
 $$;
 
+-- Switches off any account whose plan end date has passed. Pass a user id to
+-- check just that user, or null to sweep everyone.
+create or replace function public.tw_expire_due(p_user uuid default null)
+returns void language sql volatile security definer set search_path = '' as $$
+  update public.profiles
+     set is_active = false
+   where is_active
+     and not is_admin
+     and expires_at is not null
+     and expires_at <= now()
+     and (p_user is null or id = p_user)
+$$;
+
 -- Use this in RLS policies on YOUR content tables:
 --   create policy "members only" on public.videos for select to authenticated
 --   using (public.tw_session_ok());
@@ -84,7 +103,7 @@ returns boolean language sql stable security definer set search_path = '' as $$
   select exists (
     select 1 from public.profiles p
     where p.id = auth.uid()
-      and (p.is_active or p.is_admin)
+      and (p.is_admin or (p.is_active and (p.expires_at is null or p.expires_at > now())))
       and p.session_id = public.tw_current_session()
   )
 $$;
@@ -138,6 +157,8 @@ begin
     raise exception 'Not signed in' using errcode = '28000';
   end if;
 
+  perform public.tw_expire_due(v_uid);
+
   update public.profiles
      set session_id  = v_sid,
          device_info = left(coalesce(nullif(trim(p_device_info), ''), 'Unknown device'), 120),
@@ -157,7 +178,9 @@ begin
   end;
 
   return json_build_object('ok', true, 'is_active', p.is_active or p.is_admin,
-    'is_admin', p.is_admin, 'full_name', p.full_name, 'email', p.email);
+    'is_admin', p.is_admin, 'full_name', p.full_name, 'email', p.email,
+    'expires_at', p.expires_at, 'plan_months', p.plan_months,
+    'expired', not p.is_active and not p.is_admin and p.expires_at is not null and p.expires_at <= now());
 end $$;
 
 -- Called on every protected page and every ~20s as a heartbeat.
@@ -171,6 +194,8 @@ begin
   if v_uid is null then
     return json_build_object('ok', false, 'reason', 'signed_out');
   end if;
+
+  perform public.tw_expire_due(v_uid);
 
   select * into p from public.profiles where id = v_uid;
   if not found then
@@ -189,7 +214,9 @@ begin
   end if;
 
   return json_build_object('ok', true, 'is_active', p.is_active or p.is_admin,
-    'is_admin', p.is_admin, 'full_name', p.full_name, 'email', p.email);
+    'is_admin', p.is_admin, 'full_name', p.full_name, 'email', p.email,
+    'expires_at', p.expires_at, 'plan_months', p.plan_months,
+    'expired', not p.is_active and not p.is_admin and p.expires_at is not null and p.expires_at <= now());
 end $$;
 
 -- Called on normal "Log out".
@@ -213,6 +240,8 @@ begin
     raise exception 'Not signed in' using errcode = '28000';
   end if;
 
+  perform public.tw_expire_due(v_uid);
+
   if exists (select 1 from public.profiles where id = v_uid and is_active) then
     return json_build_object('ok', true);
   end if;
@@ -233,19 +262,26 @@ begin
   end if;
 
   update public.activation_codes set used = true, attempts = 0 where user_id = v_uid;
-  update public.profiles set is_active = true, activated_at = now() where id = v_uid;
+  update public.profiles
+     set is_active    = true,
+         activated_at = now(),
+         plan_months  = c.plan_months,
+         expires_at   = now() + make_interval(months => c.plan_months)
+   where id = v_uid;
   return json_build_object('ok', true);
 end $$;
 
 -- ---------------------------------------------------------------------
 -- Admin
 -- ---------------------------------------------------------------------
+drop function if exists public.tw_admin_list_users();
 create or replace function public.tw_admin_list_users()
 returns table (
   id uuid, email text, full_name text, phone text,
   is_active boolean, is_admin boolean, has_session boolean, device_info text,
   last_seen timestamptz, last_login timestamptz, activated_at timestamptz, created_at timestamptz,
-  code text, code_used boolean, attempts int, code_issued_at timestamptz
+  code text, code_used boolean, attempts int, code_issued_at timestamptz,
+  expires_at timestamptz, plan_months int, code_plan_months int
 )
 language plpgsql security definer set search_path = '' as $$
 #variable_conflict use_column
@@ -253,25 +289,42 @@ begin
   if not public.tw_is_admin() then
     raise exception 'Admins only' using errcode = '42501';
   end if;
+  perform public.tw_expire_due(null);
   return query
     select p.id, p.email, p.full_name, p.phone,
            p.is_active, p.is_admin, p.session_id is not null, p.device_info,
            p.last_seen, p.last_login, p.activated_at, p.created_at,
-           c.code, c.used, c.attempts, c.issued_at
+           c.code, c.used, c.attempts, c.issued_at,
+           p.expires_at, p.plan_months, c.plan_months
     from public.profiles p
     left join public.activation_codes c on c.user_id = p.id
     order by p.created_at desc;
 end $$;
 
-create or replace function public.tw_admin_set_active(p_user uuid, p_active boolean)
+drop function if exists public.tw_admin_set_active(uuid, boolean);
+-- p_months: how long the plan lasts (1 month = KSh 300, 2 months = KSh 500).
+-- If the user still has time left, the new months are added on top of it.
+create or replace function public.tw_admin_set_active(p_user uuid, p_active boolean, p_months int default 1)
 returns void language plpgsql security definer set search_path = '' as $$
 begin
   if not public.tw_is_admin() then
     raise exception 'Admins only' using errcode = '42501';
   end if;
+  if p_active and (p_months is null or p_months < 1 or p_months > 12) then
+    raise exception 'Choose a plan between 1 and 12 months';
+  end if;
+  perform public.tw_expire_due(p_user);
   update public.profiles
-     set is_active = p_active,
-         activated_at = case when p_active then now() else activated_at end
+     set is_active    = p_active,
+         activated_at = case when p_active and not is_active then now() else activated_at end,
+         plan_months  = case when p_active then p_months else plan_months end,
+         expires_at   = case
+                          when p_active and is_active and expires_at > now()
+                            then expires_at + make_interval(months => p_months)
+                          when p_active
+                            then now() + make_interval(months => p_months)
+                          else expires_at
+                        end
    where id = p_user;
   if not found then raise exception 'User not found'; end if;
   -- Activating by hand burns the current code. Deactivating leaves it burned,
@@ -281,7 +334,9 @@ begin
   end if;
 end $$;
 
-create or replace function public.tw_admin_new_code(p_user uuid)
+drop function if exists public.tw_admin_new_code(uuid);
+-- The code carries the plan: when the user enters it they get p_months of access.
+create or replace function public.tw_admin_new_code(p_user uuid, p_months int default 1)
 returns text language plpgsql security definer set search_path = '' as $$
 declare
   v_code text := public.tw_gen_code();
@@ -289,12 +344,16 @@ begin
   if not public.tw_is_admin() then
     raise exception 'Admins only' using errcode = '42501';
   end if;
+  if p_months is null or p_months < 1 or p_months > 12 then
+    raise exception 'Choose a plan between 1 and 12 months';
+  end if;
   if not exists (select 1 from public.profiles where id = p_user) then
     raise exception 'User not found';
   end if;
-  insert into public.activation_codes (user_id, code) values (p_user, v_code)
+  insert into public.activation_codes (user_id, code, plan_months) values (p_user, v_code, p_months)
   on conflict (user_id) do update
-    set code = excluded.code, used = false, attempts = 0, issued_at = now();
+    set code = excluded.code, plan_months = excluded.plan_months,
+        used = false, attempts = 0, issued_at = now();
   return v_code;
 end $$;
 
@@ -316,21 +375,22 @@ end $$;
 -- ---------------------------------------------------------------------
 revoke execute on function public.tw_gen_code()        from public, anon, authenticated;
 revoke execute on function public.tw_handle_new_user() from public, anon, authenticated;
+revoke execute on function public.tw_expire_due(uuid)  from public, anon, authenticated;
 
 revoke execute on function
   public.tw_current_session(), public.tw_is_admin(), public.tw_session_ok(),
   public.tw_claim_session(text), public.tw_check_session(), public.tw_release_session(),
   public.tw_activate(text),
-  public.tw_admin_list_users(), public.tw_admin_set_active(uuid, boolean),
-  public.tw_admin_new_code(uuid), public.tw_admin_logout_device(uuid)
+  public.tw_admin_list_users(), public.tw_admin_set_active(uuid, boolean, int),
+  public.tw_admin_new_code(uuid, int), public.tw_admin_logout_device(uuid)
 from public, anon;
 
 grant execute on function
   public.tw_current_session(), public.tw_is_admin(), public.tw_session_ok(),
   public.tw_claim_session(text), public.tw_check_session(), public.tw_release_session(),
   public.tw_activate(text),
-  public.tw_admin_list_users(), public.tw_admin_set_active(uuid, boolean),
-  public.tw_admin_new_code(uuid), public.tw_admin_logout_device(uuid)
+  public.tw_admin_list_users(), public.tw_admin_set_active(uuid, boolean, int),
+  public.tw_admin_new_code(uuid, int), public.tw_admin_logout_device(uuid)
 to authenticated;
 
 -- Realtime: lets a device react instantly when it's activated, deactivated or logged out.
@@ -339,6 +399,9 @@ begin
   alter publication supabase_realtime add table public.profiles;
 exception when duplicate_object or undefined_object then null;
 end $$;
+
+-- Tell the API to pick up the new/changed functions straight away.
+notify pgrst, 'reload schema';
 
 -- ---------------------------------------------------------------------
 -- LAST STEP: make yourself admin (sign up on the site first, then run):

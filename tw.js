@@ -161,7 +161,7 @@
   function allowed(st, need) {
     if (!st || !st.ok) { kick((st && st.reason) || "session_ended"); return false; }
     if (need === "admin" && !st.is_admin) { go(st.is_active ? C.HOME_PAGE : C.ACTIVATE_PAGE); return false; }
-    if (need === "active" && !st.is_active) { go(C.ACTIVATE_PAGE); return false; }
+    if (need === "active" && !st.is_active) { go(C.ACTIVATE_PAGE, st.expired ? { reason: "expired" } : null); return false; }
     if (need === "inactive" && st.is_active) { go(routeFor(st)); return false; }
     return true;
   }
@@ -218,6 +218,54 @@
     } catch (e) {}
   }
 
+  // ---------- plans ----------
+  const PLANS = (C.PLANS && C.PLANS.length) ? C.PLANS : [{ months: 1, price: 300 }, { months: 2, price: 500 }];
+  const monthsText = (m) => m + (m === 1 ? " month" : " months");
+  const planLabel = (m) => {
+    const p = PLANS.find((x) => x.months === m);
+    return monthsText(m) + (p ? " · KSh " + p.price : "");
+  };
+  const fmtDate = (ts) =>
+    new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  function timeLeft(ts) {
+    const ms = new Date(ts) - Date.now();
+    if (ms <= 0) return "Expired";
+    const d = Math.floor(ms / 86400000);
+    if (d >= 1) return d + (d === 1 ? " day left" : " days left");
+    const h = Math.max(1, Math.floor(ms / 3600000));
+    return h + (h === 1 ? " hour left" : " hours left");
+  }
+
+  // Popup shown when a user's plan has run out. Lets them ask for a recharge on WhatsApp.
+  function rechargePopup(st) {
+    if (document.querySelector(".modal.recharge")) return;
+    const m = document.createElement("div");
+    m.className = "modal recharge";
+    const when = st && st.expires_at ? " on " + fmtDate(st.expires_at) : "";
+    const ask = (p) => waLink(
+      `Hello, my Trick World account has expired and I want to recharge.\n` +
+      `Plan: ${monthsText(p.months)} (KSh ${p.price})\nName: ${(st && st.full_name) || ""}\nEmail: ${(st && st.email) || ""}`
+    );
+    m.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="rcTitle">
+      <div class="rc-icon">${icon("alert", 22)}</div>
+      <h2 id="rcTitle">Your account has expired</h2>
+      <p>Your plan ended${esc(when)}. Recharge to keep using Trick World.</p>
+      <div class="plans">
+        ${PLANS.map((p) => `<a class="plan" target="_blank" rel="noopener" href="${ask(p)}">
+            <span class="plan-name">${monthsText(p.months)}</span>
+            <span class="plan-price">KSh ${p.price}</span>
+            <span class="plan-cta">${icon("message", 14)} Recharge on WhatsApp</span>
+          </a>`).join("")}
+      </div>
+      <p class="rc-note">Pay and send us a message. We'll send you a new code to enter on this page.</p>
+      <div class="modal-actions"><button class="btn btn-primary" data-close>I have a code</button></div>
+    </div>`;
+    document.body.appendChild(m);
+    const close = () => m.remove();
+    m.querySelector("[data-close]").onclick = close;
+    m.addEventListener("click", (e) => { if (e.target === m) close(); });
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     paint();
     if (/YOUR-PROJECT|YOUR-ANON/.test(C.SUPABASE_URL + C.SUPABASE_ANON_KEY)) {
@@ -229,5 +277,6 @@
     sb, config: C, esc, icon, paint, toast, notice, setLoading, friendlyError,
     toIntl, waLink, deviceLabel, go, routeFor,
     claimSession, checkSession, guard, redirectIfSignedIn, logout,
+    PLANS, monthsText, planLabel, fmtDate, timeLeft, rechargePopup,
   };
 })();

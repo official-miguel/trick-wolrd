@@ -29,9 +29,10 @@
         </div>
 
         <div class="card-head">
-          <h1>Activate your account</h1>
-          <p>Enter the 8-character activation code for your account.</p>
+          <h1 id="title">Activate your account</h1>
+          <p id="subtitle">Enter the 8-character activation code for your account.</p>
         </div>
+        <div class="notice warn" id="expiredNotice" hidden></div>
 
         <form id="form" novalidate autocomplete="off">
           <div class="field">
@@ -55,7 +56,7 @@
         <div class="done-icon"><span data-icon="check" data-size="22"></span></div>
         <div class="card-head" style="margin:0">
           <h1>Account activated</h1>
-          <p>Taking you to Trick World...</p>
+          <p id="successText">Taking you to Trick World...</p>
         </div>
       </div>
     </main>
@@ -72,10 +73,19 @@
       const successView = document.getElementById("successView");
       const activateView = document.getElementById("activateView");
 
-      function done() {
+      async function done() {
+        if (!successView.hidden) return;
         activateView.hidden = true;
         successView.hidden = false;
-        setTimeout(() => TW.go(C.HOME_PAGE), 1200);
+        document.querySelector(".modal.recharge")?.remove();
+        try {
+          const s = await TW.checkSession();
+          if (s.expires_at) {
+            document.getElementById("successText").textContent =
+              `Active until ${TW.fmtDate(s.expires_at)}. Taking you to Trick World...`;
+          }
+        } catch (e) {}
+        setTimeout(() => TW.go(C.HOME_PAGE), 1800);
       }
 
       // If the super admin activates this user while the page is open, move on straight away.
@@ -85,12 +95,25 @@
       });
       if (st.is_active) return TW.go(TW.routeFor(st));
 
+      const expired = !!st.expired || new URLSearchParams(location.search).get("reason") === "expired";
       document.getElementById("email").textContent = st.email || "";
       const local = String(C.WHATSAPP_NUMBER).replace(/\D/g, "");
       document.getElementById("waNumber").textContent = local.replace(/^(\d{4})(\d{3})(\d{3})$/, "$1 $2 $3");
-      document.getElementById("wa").href = TW.waLink(
-        `Hello, I've created a Trick World account and I need an activation code.\nName: ${st.full_name || ""}\nEmail: ${st.email || ""}`
+      const planList = TW.PLANS.map((p) => `${TW.monthsText(p.months)} KSh ${p.price}`).join(", ");
+      document.getElementById("wa").href = TW.waLink(expired
+        ? `Hello, my Trick World account has expired and I want to recharge (${planList}).\nName: ${st.full_name || ""}\nEmail: ${st.email || ""}`
+        : `Hello, I've created a Trick World account and I need an activation code.\nName: ${st.full_name || ""}\nEmail: ${st.email || ""}`
       );
+      if (expired) {
+        document.getElementById("title").textContent = "Recharge your account";
+        document.getElementById("subtitle").textContent = "Enter the new code we sent you after your recharge.";
+        TW.notice(document.getElementById("expiredNotice"),
+          "Your plan has expired" + (st.expires_at ? " (ended " + TW.fmtDate(st.expires_at) + ")" : "") +
+          ". Plans: " + planList + ".", "warn");
+        document.querySelector(".ask-title").textContent = "Need to recharge?";
+        document.querySelector("#wa span:last-child").textContent = "Recharge on WhatsApp";
+        TW.rechargePopup(st);
+      }
       document.getElementById("logout").onclick = TW.logout;
 
       // ----- 8 code boxes with auto-advance + paste -----

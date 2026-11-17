@@ -12,6 +12,12 @@ window.TW_CONFIG = {
   ACTIVATE_PAGE: "activate.html",
   ADMIN_PAGE: "superadmin.html",
 
+  // Paid plans the super admin can pick when activating someone (prices in KSh).
+  PLANS: [
+    { months: 1, price: 300 },
+    { months: 2, price: 500 },
+  ],
+
   // How often an open page re-checks that it's still the active device.
   HEARTBEAT_SECONDS: 20,
 };
